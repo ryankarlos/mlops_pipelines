@@ -1,14 +1,29 @@
 # MLOps pipelines with Flyte
 
-Trying out a range of features in FlyteKit
+Trying out a range of features for [FlyteKit](https://docs.flyte.org/projects/flytekit/en/latest/index.html)
+- Flyte's Python SDK for developing tasks and workflows
+
+## Activate environment and install hooks
 
 
-## Activate environment
+Install poetry, dependencies and spawn shell
 
 ```shell
 pip install poetry
 poetry install
 poetry shell
+```
+
+set up the git hook scripts to run automatically on git commit.
+
+```
+$ pre-commit install
+```
+
+Run the hooks against all of the files to check working ok
+
+```
+$ pre-commit run --all-files
 ```
 
 ## Running workflow locally
