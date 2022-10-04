@@ -109,7 +109,6 @@ def fit(
     )
     m.fit(x_df, y_df)
 
-    # TODO model Blob should be a file like object
     fname = "model.joblib.dat"
     joblib.dump(m, fname)
     return (fname,)
