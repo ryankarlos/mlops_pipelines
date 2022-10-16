@@ -1,10 +1,9 @@
 """
 Implementation of https://docs.flyte.org/projects/cookbook/en/latest/auto/core/type_system/structured_dataset.html
-for showing how vaex df are accepted by the StructuredDataset
+for showing how flytekit-vaex df are accepted by the StructuredDataset
 """
 from typing import Annotated
 
-import numpy as np
 import pandas as pd
 import vaex
 from flytekit import kwtypes, task, workflow
@@ -13,59 +12,59 @@ from flytekit.types.structured.structured_dataset import (
     StructuredDataset,
     StructuredDatasetTransformerEngine,
 )
-
-from flyte_transformers.vaex_typetransformer import (
-    VaexDecodingHandlers,
-    VaexEncodingHandlers,
+from flytekitplugins.vaex.sd_transformer import (
+    ParquetToVaxDataFrameDecodingHandler,
+    VaexDataFrameRenderer,
+    VaexDataFrameToParquetEncodingHandlers,
 )
 
 superset_cols = kwtypes(Name=str, Age=int, Height=int)
 subset_cols = kwtypes(Age=int)
 
 
-StructuredDatasetTransformerEngine.register(
-    VaexEncodingHandlers(vaex.DataFrame, supported_format=PARQUET)
+StructuredDatasetTransformerEngine.register(VaexDataFrameToParquetEncodingHandlers())
+StructuredDatasetTransformerEngine.register(ParquetToVaxDataFrameDecodingHandler())
+StructuredDatasetTransformerEngine.register_renderer(
+    vaex.DataFrame, VaexDataFrameRenderer()
 )
-StructuredDatasetTransformerEngine.register(
-    VaexDecodingHandlers(vaex.DataFrame, supported_format=PARQUET)
-)
+
+
+subset_schema = Annotated[StructuredDataset, kwtypes(col2=str), PARQUET]
 
 
 @task
-def to_vaex(
-    ds: Annotated[StructuredDataset, subset_cols]
-) -> Annotated[StructuredDataset, subset_cols, PARQUET]:
-    vaex_df = ds.open(np.ndarray).all()
+def generate() -> subset_schema:
+    pd_df = pd.DataFrame({"col1": [1, 3, 2], "col2": list("abc")})
+    vaex_df = vaex.from_pandas(pd_df)
     return StructuredDataset(dataframe=vaex_df)
 
 
 @task
-def get_df(a: int) -> Annotated[vaex.DataFrame, superset_cols]:
-    """
-    Generate a sample dataframe
-    """
-
-    df = pd.DataFrame({"Name": ["Tom", "Joseph"], "Age": [a, 22], "Height": [160, 178]})
-    vaex_df = vaex.from_pandas(df)
-    return vaex_df
-
-
-@task
-def get_subset_df(
-    df: Annotated[vaex.DataFrame, subset_cols]
-) -> Annotated[StructuredDataset, subset_cols]:
+def consume(df: subset_schema) -> subset_schema:
     df = df.open(vaex.DataFrame).all()
-    df = vaex.concat([df, vaex.from_pandas_df(pd.DataFrame([[30]], columns=["Age"]))])
+
+    assert df["col2"][0] == "a"
+    assert df["col2"][1] == "b"
+    assert df["col2"][2] == "c"
+
     return StructuredDataset(dataframe=df)
 
 
+@task
+def vaex_renderer(df: subset_schema):
+    df = df.open(vaex.DataFrame).all()
+    assert VaexDataFrameRenderer().to_html(df) == pd.DataFrame(
+        df.describe().transpose(), columns=df.describe().columns
+    ).to_html(index=False)
+
+
 @workflow
-def vaex_compatibility_wf(a: int) -> Annotated[StructuredDataset, subset_cols]:
-    df = get_df(a=a)
-    ds = get_subset_df(df=df)  # noqa
-    return to_vaex(ds=ds)
+def wf():
+    df = generate()
+    df = consume(df=df)
+    vaex_renderer(df=df)
 
 
 if __name__ == "__main__":
-    vaex_df_one = vaex_compatibility_wf(a=42).open(vaex.DataFrame).all()
-    print(f"vaex DataFrame compatibility check output: {vaex_df_one}")
+    wf()
+    # assert result is not None
