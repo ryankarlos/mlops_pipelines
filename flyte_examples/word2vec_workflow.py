@@ -21,12 +21,12 @@ from nltk.corpus import wordnet
 from nltk.stem import WordNetLemmatizer
 from sklearn.manifold import TSNE
 
-nltk.download("abc")
-nltk.download("punkt")
-nltk.download("stopwords")
-nltk.download("wordnet")
-nltk.download("omw-1.4")
-nltk.download("averaged_perceptron_tagger")
+# nltk.download("abc")
+# nltk.download("punkt")
+# nltk.download("stopwords")
+# nltk.download("wordnet")
+# nltk.download("omw-1.4")
+# nltk.download("averaged_perceptron_tagger")
 
 SENTENCE_A = "Obama speaks to the media in Illinois"
 SENTENCE_B = "The president greets the press in Chicago"
@@ -41,10 +41,15 @@ test_data_dir = os.path.join(gensim.__path__[0], "test", "test_data")
 lee_train_file = os.path.join(test_data_dir, "lee_background.cor")
 lee_test_file = os.path.join(test_data_dir, "lee.cor")
 
-dataset = typing.NamedTuple(
-    "GenerateSplitDataOutputs",
-    train_data=typing.List[str],
-    test_data=typing.List[str],
+plotdata = typing.NamedTuple(
+    "PlottingData",
+    x_values=typing.List[np.float32],
+    y_values=typing.List[np.float32],
+    labels=np.array
+)
+
+workflow_outputs = typing.NamedTuple(
+    "WorkflowOutputs", model=FlyteFile[MODELSER_WORD2VEC]
 )
 
 
@@ -60,7 +65,7 @@ class MyCorpus:
             yield simple_preprocess(line)
 
 
-@task(cache_version="1.0", cache=True, limits=Resources(mem="200Mi"))
+@task
 def build_train_test_dataset() -> List[List[str]]:
     # Set file names for train and test data
     sentences_train = MyCorpus(lee_train_file)
@@ -85,10 +90,10 @@ class Word2VecModelHyperparams(object):
     compute_loss: bool = True
 
 
-@task(cache_version="1.0", cache=True, limits=Resources(mem="200Mi"))
+@task
 def train_model(
     training_data: List[List[str]], hyperparams: Word2VecModelHyperparams
-) -> model_file:
+)->model_file:
     # instantiating and training the Word2Vec model
     model = gensim.models.Word2Vec(
         training_data,
@@ -99,78 +104,64 @@ def train_model(
     )
     training_loss = model.get_latest_training_loss()
     print(training_loss)
-    file = serialise_model(model=model, file="word2vec.model")
-    return file
-
-
-def serialise_model(model: gensim.models.Word2Vec, file: str) -> model_file:
+    file = "word2vec.model"
     model.save(file)
-    return file
-
-
-def deserialise_model(
-    model_ser: FlyteFile[MODELSER_WORD2VEC],
-) -> gensim.models.Word2Vec:
-    model = gensim.models.Word2Vec.load(model_ser)
-    return model
+    return (file,)
 
 
 @task(cache_version="1.0", cache=True, limits=Resources(mem="200Mi"))
-def word_similarities(model_ser: FlyteFile[MODELSER_WORD2VEC]):
-    model = deserialise_model(model_ser)
+def word_similarities(model_ser: FlyteFile[MODELSER_WORD2VEC], word:str):
+    model = gensim.models.Word2Vec.load(model_ser.path)
     wv = model.wv
-    print(wv["nights"])
-    print(wv.most_similar("nights"))
+    print(wv[word])
+    print(wv.most_similar(word, topn=10))
 
 
 @task(cache_version="1.0", cache=True, limits=Resources(mem="200Mi"))
-def word_movers_distance(model_ser: FlyteFile[MODELSER_WORD2VEC]):
+def word_movers_distance(model_ser: FlyteFile[MODELSER_WORD2VEC])->float:
     sentences = [SENTENCE_A, SENTENCE_B]
     results = []
     for i in sentences:
         result = [w for w in utils.tokenize(i) if w not in STOPWORDS]
         results.append(result)
-    model = deserialise_model(model_ser)
+    model = gensim.models.Word2Vec.load(model_ser.path)
     distance = model.wv.wmdistance(*results)
     print(f"Word Movers Distance is {distance} (lower means closer)")
+    return distance
 
 
-def reduce_dimensions(model):
-    num_dimensions = 2  # final num dimensions (2D, 3D, etc)
-
-    # extract the words & their vectors, as numpy arrays
+@task(cache_version="1.0", cache=True, limits=Resources(mem="200Mi"))
+def reduce_dimensions(model_ser: FlyteFile[MODELSER_WORD2VEC])->plotdata:
+    model = gensim.models.Word2Vec.load(model_ser.path)
+    num_dimensions = 2
     vectors = np.asarray(model.wv.vectors)
-    labels = np.asarray(model.wv.index_to_key)  # fixed-width numpy strings
-
-    # reduce using t-SNE
+    labels = np.asarray(model.wv.index_to_key)
     tsne = TSNE(n_components=num_dimensions, random_state=0)
     vectors = tsne.fit_transform(vectors)
-
     x_vals = [v[0] for v in vectors]
     y_vals = [v[1] for v in vectors]
+    plot_with_matplotlib(x_vals, y_vals, labels)
     return x_vals, y_vals, labels
 
 
-def plot_with_matplotlib(x_vals, y_vals, labels):
+def plot_with_matplotlib(x, y, labels):
     plt.figure(figsize=(12, 12))
-    plt.scatter(x_vals, y_vals)
-    #
-    # Label randomly subsampled 25 data points
-    #
+    plt.scatter(x,y)
     indices = list(range(len(labels)))
     selected_indices = random.sample(indices, 25)
     for i in selected_indices:
-        plt.annotate(labels[i], (x_vals[i], y_vals[i]))
+        plt.annotate(labels[i], (x[i], y[i]))
+    plt.show()
 
 
 @workflow
-def nlp_workflow():
+def nlp_workflow()->workflow_outputs:
     split_data = build_train_test_dataset()
-    train_model(training_data=split_data, hyperparams=Word2VecModelHyperparams())
-    # word_similarities(model_ser=model.model)
-
-
-# word_movers_distance(model=model.model)
+    model = train_model(training_data=split_data, hyperparams=Word2VecModelHyperparams())
+    word_similarities(model_ser=model.model, word="computer")
+    word_movers_distance(model_ser=model.model)
+    plot_data = reduce_dimensions(model_ser=model.model)
+    return (model.model,)
 
 
 if __name__ == "__main__":
