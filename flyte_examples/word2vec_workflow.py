@@ -2,55 +2,57 @@ import os
 import random
 import typing
 from dataclasses import dataclass
+from pprint import pprint
 from pprint import pprint as print
-from typing import List
+from typing import List, Tuple
 
 import gensim
 import matplotlib.pyplot as plt
-import nltk
 import numpy as np
 from dataclasses_json import dataclass_json
 from flytekit import Resources, task, workflow
 from flytekit.types.file import FlyteFile
 from gensim import utils
-from gensim.models.doc2vec import TaggedDocument
-from gensim.parsing.preprocessing import STOPWORDS
+from gensim.corpora import Dictionary
+from gensim.models import LdaModel, Word2Vec
+from gensim.parsing.preprocessing import STOPWORDS, remove_stopwords
 from gensim.test.utils import datapath
-from gensim.utils import simple_preprocess
-from nltk.corpus import wordnet
 from nltk.stem import WordNetLemmatizer
+from nltk.tokenize import RegexpTokenizer
 from sklearn.manifold import TSNE
 
-# nltk.download("abc")
-# nltk.download("punkt")
-# nltk.download("stopwords")
-# nltk.download("wordnet")
-# nltk.download("omw-1.4")
-# nltk.download("averaged_perceptron_tagger")
-
-SENTENCE_A = "Obama speaks to the media in Illinois"
-SENTENCE_B = "The president greets the press in Chicago"
-
 # typing for serialised model file
-MODELSER_WORD2VEC = typing.TypeVar("model")
-model_file = typing.NamedTuple("ModelFile", model=FlyteFile[MODELSER_WORD2VEC])
+MODELSER_NLP = typing.TypeVar("model")
+MODELSER_NPY = typing.TypeVar("model.expElogbeta.npy")
+model_file = typing.NamedTuple("ModelFile", model=FlyteFile[MODELSER_NLP, MODELSER_NPY])
 
-POS_TAG = "Noun"
 # Set file names for train and test data
 test_data_dir = os.path.join(gensim.__path__[0], "test", "test_data")
 lee_train_file = os.path.join(test_data_dir, "lee_background.cor")
-lee_test_file = os.path.join(test_data_dir, "lee.cor")
 
 plotdata = typing.NamedTuple(
     "PlottingData",
     x_values=typing.List[np.float32],
     y_values=typing.List[np.float32],
-    labels=np.array
+    labels=np.array,
+)
+
+
+bowdata = typing.NamedTuple(
+    "BagOfWordsOutput",
+    bow=List[List[Tuple]],
+    id2word=List[List[Tuple]],
 )
 
 workflow_outputs = typing.NamedTuple(
-    "WorkflowOutputs", model=FlyteFile[MODELSER_WORD2VEC]
+    "WorkflowOutputs",
+    word2vecmodel=FlyteFile[MODELSER_NLP],
+    ldamodel=FlyteFile[MODELSER_NLP],
 )
+
+
+SENTENCE_A = "Australian cricket captain has supported fast bowler"
+SENTENCE_B = "Fast bowler received support from cricket captain"
 
 
 class MyCorpus:
@@ -62,15 +64,21 @@ class MyCorpus:
     def __iter__(self):
         for line in open(self.corpus_path):
             # assume there's one document per line, tokens separated by whitespace
-            yield simple_preprocess(line)
+            yield pre_processing(line)
+
+
+def pre_processing(line: str) -> List[str]:
+    tokenizer = RegexpTokenizer(r"\w+")
+    tokens = tokenizer.tokenize(remove_stopwords(line.lower()))
+    lemmatizer = WordNetLemmatizer()
+    return [lemmatizer.lemmatize(token) for token in tokens]
 
 
 @task
-def build_train_test_dataset() -> List[List[str]]:
+def generate_processed_corpus() -> List[List[str]]:
     # Set file names for train and test data
     sentences_train = MyCorpus(lee_train_file)
     train_corpus = list(sentences_train)
-    print(train_corpus[:2])
     return train_corpus
 
 
@@ -85,17 +93,32 @@ class Word2VecModelHyperparams(object):
     """
 
     min_count: int = 1
-    vector_size: int = 100
+    vector_size: int = 200
     workers: int = 4
     compute_loss: bool = True
 
 
+@dataclass_json
+@dataclass
+class LDAModelHyperparams(object):
+    """
+    These are the lda model hyper parameters which can be set for training.
+    """
+
+    num_topics: int = 5
+    alpha: str = "auto"
+    passes: int = 10
+    chunksize: int = 100
+    update_every: int = 1
+    random_state: int = 100
+
+
 @task
-def train_model(
+def train_word2vec_model(
     training_data: List[List[str]], hyperparams: Word2VecModelHyperparams
-)->model_file:
+) -> model_file:
     # instantiating and training the Word2Vec model
-    model = gensim.models.Word2Vec(
+    model = Word2Vec(
         training_data,
         min_count=hyperparams.min_count,
         workers=hyperparams.workers,
@@ -103,36 +126,61 @@ def train_model(
         compute_loss=hyperparams.compute_loss,
     )
     training_loss = model.get_latest_training_loss()
-    print(training_loss)
+    print(f"training loss: {training_loss}")
     file = "word2vec.model"
     model.save(file)
     return (file,)
 
 
+@task
+def train_lda_model(
+    corpus: List[List[str]], hyperparams: LDAModelHyperparams
+) -> model_file:
+    id2word = Dictionary(corpus)
+    bow_corpus = [id2word.doc2bow(doc) for doc in corpus]
+    id_words = [[(id2word[id], count) for id, count in line] for line in bow_corpus]
+    print(f"sample of bag of words generated: {id_words[:2]}")
+    lda = LdaModel(
+        corpus=bow_corpus,
+        id2word=id2word,
+        num_topics=hyperparams.num_topics,
+        alpha=hyperparams.alpha,
+        passes=hyperparams.passes,
+        chunksize=hyperparams.chunksize,
+        update_every=hyperparams.update_every,
+        random_state=hyperparams.random_state,
+    )
+    pprint(f"Shows words in each topic: {lda.print_topics(num_words=5)}")
+    file = "lda.model"
+    lda.save(file)
+    return (file,)
+
+
 @task(cache_version="1.0", cache=True, limits=Resources(mem="200Mi"))
-def word_similarities(model_ser: FlyteFile[MODELSER_WORD2VEC], word:str):
-    model = gensim.models.Word2Vec.load(model_ser.path)
+def word_similarities(model_ser: FlyteFile[MODELSER_NLP], word: str):
+    model = Word2Vec.load(model_ser.path)
     wv = model.wv
-    print(wv[word])
-    print(wv.most_similar(word, topn=10))
+    print(f"Word vector for {word}:{wv[word]}")
+    print(f"Most similar words in corpus to {word}: {wv.most_similar(word, topn=10)}")
 
 
 @task(cache_version="1.0", cache=True, limits=Resources(mem="200Mi"))
-def word_movers_distance(model_ser: FlyteFile[MODELSER_WORD2VEC])->float:
+def word_movers_distance(model_ser: FlyteFile[MODELSER_NLP]) -> float:
     sentences = [SENTENCE_A, SENTENCE_B]
     results = []
     for i in sentences:
         result = [w for w in utils.tokenize(i) if w not in STOPWORDS]
         results.append(result)
-    model = gensim.models.Word2Vec.load(model_ser.path)
+    model = Word2Vec.load(model_ser.path)
     distance = model.wv.wmdistance(*results)
+    print(f"Computing word movers distance for: {SENTENCE_A} and {SENTENCE_B} ")
     print(f"Word Movers Distance is {distance} (lower means closer)")
     return distance
 
 
 @task(cache_version="1.0", cache=True, limits=Resources(mem="200Mi"))
-def reduce_dimensions(model_ser: FlyteFile[MODELSER_WORD2VEC])->plotdata:
-    model = gensim.models.Word2Vec.load(model_ser.path)
+def tsne_and_plot(model_ser: FlyteFile[MODELSER_NLP]) -> plotdata:
+    model = Word2Vec.load(model_ser.path)
     num_dimensions = 2
     vectors = np.asarray(model.wv.vectors)
     labels = np.asarray(model.wv.index_to_key)
@@ -146,7 +194,7 @@ def reduce_dimensions(model_ser: FlyteFile[MODELSER_WORD2VEC])->plotdata:
 
 def plot_with_matplotlib(x, y, labels):
     plt.figure(figsize=(12, 12))
-    plt.scatter(x,y)
+    plt.scatter(x, y)
     indices = list(range(len(labels)))
     selected_indices = random.sample(indices, 25)
     for i in selected_indices:
@@ -155,13 +203,16 @@ def plot_with_matplotlib(x, y, labels):
 
 
 @workflow
-def nlp_workflow()->workflow_outputs:
-    split_data = build_train_test_dataset()
-    model = train_model(training_data=split_data, hyperparams=Word2VecModelHyperparams())
-    word_similarities(model_ser=model.model, word="computer")
-    word_movers_distance(model_ser=model.model)
-    plot_data = reduce_dimensions(model_ser=model.model)
-    return (model.model,)
+def nlp_workflow() -> workflow_outputs:
+    corpus = generate_processed_corpus()
+    model_wv = train_word2vec_model(
+        training_data=corpus, hyperparams=Word2VecModelHyperparams()
+    )
+    model_lda = train_lda_model(corpus=corpus, hyperparams=LDAModelHyperparams())
+    word_similarities(model_ser=model_wv.model, word="computer")
+    word_movers_distance(model_ser=model_wv.model)
+    tsne_and_plot(model_ser=model_wv.model)
+    return (model_wv.model, model_lda.model)
 
 
 if __name__ == "__main__":
