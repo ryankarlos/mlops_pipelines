@@ -1,0 +1,11 @@
+pandas
+xgboost
+flytekit
+joblib
+dataclasses-json
+requests
+vaex
+wheel
+plotly
+flytekitplugins-deck-standard
+scikit-learn
